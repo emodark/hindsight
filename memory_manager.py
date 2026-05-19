@@ -224,17 +224,25 @@ class MemoryManager:
         )
         compressed = semantic_compress(summary_text)
 
-        # 写入 agent-memory/<date>/summary.md（供 prefetch 宏观层使用）
-        summary_dir = os.path.expanduser(f"~/wiki/docs/agent-memory/{date_str}")
-        os.makedirs(summary_dir, exist_ok=True)
-        summary_md = (
-            f"# {date_str} 日汇总\n\n"
-            f"## 核心结论\n{compressed}\n\n"
-            f"## 源数据\n共 {len(results)} 条记忆\n"
-            f"生成时间: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')}\n"
+        # 写入滚动宏观记忆 ~/wiki/docs/agent-memory/recent_macro.md（保留最近14天）
+        macro_path = os.path.expanduser("~/wiki/docs/agent-memory/recent_macro.md")
+        summary_line = f"- **{date_str}**: {compressed[:200]}"
+        os.makedirs(os.path.dirname(macro_path), exist_ok=True)
+        if os.path.exists(macro_path):
+            with open(macro_path) as f:
+                lines = [l.rstrip() for l in f if l.startswith("- **")]
+            lines.append(summary_line)
+            # 只保留最近14天
+            lines = lines[-14:]
+        else:
+            lines = [summary_line]
+        macro_content = (
+            "# 近期宏观记忆（最近14天滚动）\n\n"
+            + "\n".join(lines)
+            + f"\n\n---\n最后更新: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M')}\n"
         )
-        with open(os.path.join(summary_dir, "summary.md"), "w") as f:
-            f.write(summary_md)
+        with open(macro_path, "w") as f:
+            f.write(macro_content)
 
         # Store as daily summary
         return self.store(
