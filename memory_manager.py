@@ -22,7 +22,7 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime, UTC
+from datetime import datetime, UTC, date, timedelta
 from typing import Any
 
 # ── Scene tag definitions ────────────────────────────────────────────
@@ -224,22 +224,67 @@ class MemoryManager:
         )
         compressed = semantic_compress(summary_text)
 
-        # 写入滚动宏观记忆 ~/wiki/docs/agent-memory/recent_macro.md（保留最近14天）
+        # ── 写入/更新 recent_macro.md ──
         macro_path = os.path.expanduser("~/wiki/docs/agent-memory/recent_macro.md")
-        summary_line = f"- **{date_str}**: {compressed[:200]}"
         os.makedirs(os.path.dirname(macro_path), exist_ok=True)
+
+        # 解析现有文件
+        macro_lines = []  # 宏观结论行
+        detail_lines = []  # 详情索引行
+        today = date.today()
+        today_prefix = date_str[5:]  # MM-DD
+
         if os.path.exists(macro_path):
             with open(macro_path) as f:
-                lines = [l.rstrip() for l in f if l.startswith("- **")]
-            lines.append(summary_line)
-            # 只保留最近14天
-            lines = lines[-14:]
-        else:
-            lines = [summary_line]
+                all_lines = f.readlines()
+            section = None
+            for line in all_lines:
+                stripped = line.strip()
+                if stripped.startswith("## 宏观结论"):
+                    section = "macro"
+                    continue
+                elif stripped.startswith("## 近期详情索引"):
+                    section = "detail"
+                    continue
+                elif stripped.startswith("## ") or stripped.startswith("---"):
+                    section = None
+                    continue
+                if section == "macro" and stripped.startswith("- **"):
+                    macro_lines.append(stripped)
+                elif section == "detail" and stripped.startswith("- ") and "→ h:" in stripped:
+                    detail_lines.append(stripped)
+
+        # 宏观结论：追加新行 + 保留14天
+        summary_line = f"- **{date_str}**: {compressed[:200]}"
+        macro_lines.append(summary_line)
+        macro_lines = macro_lines[-14:]
+
+        # 详情索引：清理超出14天的旧条目
+        cutoff = timedelta(days=14)
+        clean_details = []
+        for d in detail_lines:
+            # 提取日期标签 [MM-DD]
+            import re as _re
+            m = _re.search(r'\[(\d{2})-(\d{2})\]$', d)
+            if m:
+                entry_month, entry_day = int(m.group(1)), int(m.group(2))
+                try:
+                    entry_date = date(today.year, entry_month, entry_day)
+                    if today - entry_date <= cutoff:
+                        clean_details.append(d)
+                except ValueError:
+                    clean_details.append(d)  # 日期无效则保留
+            else:
+                clean_details.append(d)  # 无日期标签则保留
+
+        # 写回文件
         macro_content = (
             "# 近期宏观记忆（最近14天滚动）\n\n"
-            + "\n".join(lines)
-            + f"\n\n---\n最后更新: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M')}\n"
+            "## 宏观结论\n"
+            + "\n".join(macro_lines) + "\n\n"
+            "## 近期详情索引\n"
+            + ("\n".join(clean_details) + "\n" if clean_details else "(暂无)\n")
+            + f"\n---\n最后更新: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M')}\n"
         )
         with open(macro_path, "w") as f:
             f.write(macro_content)
