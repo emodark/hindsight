@@ -20,3 +20,9 @@ archive/
 
 # 系统文件
 =2.0.0
+
+# 有密钥的文件
+doubao-online.toml
+config.json
+config-online-only.json
+CONFIG_COMPLETE.md

@@ -224,6 +224,18 @@ class MemoryManager:
         )
         compressed = semantic_compress(summary_text)
 
+        # 写入 agent-memory/<date>/summary.md（供 prefetch 宏观层使用）
+        summary_dir = os.path.expanduser(f"~/wiki/docs/agent-memory/{date_str}")
+        os.makedirs(summary_dir, exist_ok=True)
+        summary_md = (
+            f"# {date_str} 日汇总\n\n"
+            f"## 核心结论\n{compressed}\n\n"
+            f"## 源数据\n共 {len(results)} 条记忆\n"
+            f"生成时间: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        with open(os.path.join(summary_dir, "summary.md"), "w") as f:
+            f.write(summary_md)
+
         # Store as daily summary
         return self.store(
             compressed,
