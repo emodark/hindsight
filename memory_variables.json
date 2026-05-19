@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "variables": {
+    "language": {
+      "value": "中文",
+      "weight": 1.0,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "timezone": {
+      "value": "Asia/Shanghai",
+      "weight": 1.0,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "communication_style": {
+      "value": "直接简洁",
+      "weight": 0.9,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "response_language": {
+      "value": "中文简体",
+      "weight": 1.0,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "analysis_focus": {
+      "value": "股票技术分析",
+      "weight": 0.8,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "risk_preference": {
+      "value": "中长期持有",
+      "weight": 0.8,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "name": {
+      "value": "小虾米",
+      "weight": 0.9,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    },
+    "role": {
+      "value": "资深证券分析师+工程师",
+      "weight": 0.9,
+      "source": "manual",
+      "created_at": "2026-05-09T19:11:02+0800"
+    }
+  },
+  "updated_at": "2026-05-09T19:11:02+0800"
+}
