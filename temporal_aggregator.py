@@ -24,42 +24,66 @@ from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
 
 API_BASE = "http://127.0.0.1:9177/v1/default/banks/hermes"
+REQUEST_TIMEOUT = 30  # 秒，语义搜索随库增长变慢
+MAX_RETRIES = 2
+
+
+def _request(url: str, data: bytes = None, method: str = None,
+             timeout: int = REQUEST_TIMEOUT) -> dict:
+    """带重试的 HTTP 请求。"""
+    headers = {"Content-Type": "application/json"}
+    last_err = None
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            req = Request(url, data=data, headers=headers, method=method)
+            resp = urlopen(req, timeout=timeout)
+            return json.loads(resp.read().decode())
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                print(f"⚠️ 请求失败({e})，{wait}s后重试({attempt+1}/{MAX_RETRIES})",
+                      file=sys.stderr)
+                time.sleep(wait)
+    print(f"⚠️ 请求失败(已重试{MAX_RETRIES}次): {last_err}", file=sys.stderr)
+    return {}
 
 
 def fetch_by_tag(tag: str, limit: int = 100) -> list:
-    """按标签获取记忆。"""
+    """按标签获取记忆（语义搜索，用时较长）。"""
     url = f"{API_BASE}/memories/recall"
     payload = json.dumps({"query": tag, "limit": limit,
                           "tags": [tag], "tags_match": "any"}).encode()
-    try:
-        req = Request(url, data=payload,
-                       headers={"Content-Type": "application/json"})
-        resp = urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        return data.get("results", data if isinstance(data, list) else [])
-    except Exception as e:
-        print(f"⚠️ 获取记忆失败: {e}", file=sys.stderr)
+    data = _request(url, data=payload)
+    if not data:
         return []
+    return data.get("results", data if isinstance(data, list) else [])
+
+
+def fetch_by_tag_list(tag: str, limit: int = 500) -> list:
+    """按标签获取记忆（用 list 接口 + 本地过滤，更快）。"""
+    url = f"{API_BASE}/memories/list?limit={limit}&order=-created_at"
+    data = _request(url)
+    if not data:
+        return []
+    items = data if isinstance(data, list) else data.get("items", data.get("data", []))
+    return [m for m in items if tag in (m.get("tags", []) or [])]
 
 
 def fetch_all_recent(limit: int = 500) -> list:
     """获取最近记忆列表。"""
     url = f"{API_BASE}/memories/list?limit={limit}&order=-created_at"
-    try:
-        resp = urlopen(url, timeout=15)
-        data = json.loads(resp.read().decode())
-        if isinstance(data, list):
-            return data
-        return data.get("items", data.get("data", []))
-    except Exception as e:
-        print(f"⚠️ 获取列表失败: {e}", file=sys.stderr)
+    data = _request(url)
+    if not data:
         return []
+    if isinstance(data, list):
+        return data
+    return data.get("items", data.get("data", []))
 
 
 def tag_exists(tag: str) -> bool:
-    """检查 hindsight 中是否已有该标签的记忆。"""
-    results = fetch_by_tag(tag, limit=1)
-    return len(results) > 0
+    """检查 hindsight 中是否已有该标签的记忆（用 list 接口）。"""
+    return len(fetch_by_tag_list(tag, limit=1)) > 0
 
 
 def write_summary(content: str, tags: list[str]) -> bool:
@@ -68,15 +92,8 @@ def write_summary(content: str, tags: list[str]) -> bool:
     payload = json.dumps({
         "items": [{"content": content[:2000], "tags": tags}]
     }).encode()
-    try:
-        req = Request(url, data=payload,
-                       headers={"Content-Type": "application/json"},
-                       method="POST")
-        resp = urlopen(req, timeout=15)
-        return True
-    except Exception as e:
-        print(f"⚠️ 写入失败: {e}", file=sys.stderr)
-        return False
+    result = _request(url, data=payload, method="POST")
+    return bool(result)
 
 
 def compute_week_id(dt: datetime = None) -> str:
@@ -126,9 +143,9 @@ def cmd_weekly():
         print(f"⚠️ {week_id} 周摘要已存在")
         return
     
-    # 获取本周 daily 摘要
+    # 获取本周 daily 摘要（用 list 接口避免语义搜索超时）
     start_of_week = datetime.now(timezone.utc) - timedelta(days=datetime.now(timezone.utc).weekday())
-    daily_entries = fetch_by_tag("daily-summary", 50)
+    daily_entries = fetch_by_tag_list("daily-summary", 500)
     
     weekly_content = []
     for mem in daily_entries:
@@ -165,8 +182,8 @@ def cmd_monthly():
         print(f"⚠️ {month_id} 月摘要已存在")
         return
     
-    # 获取当月所有 weekly-summary
-    weekly_entries = fetch_by_tag("weekly-summary", 50)
+    # 获取当月所有 weekly-summary（用 list 接口避免语义搜索超时）
+    weekly_entries = fetch_by_tag_list("weekly-summary", 500)
     
     monthly_content = []
     for mem in weekly_entries:
