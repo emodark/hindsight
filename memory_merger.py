@@ -65,6 +65,40 @@ HINDSIGHT_API = "http://127.0.0.1:9177/v1/default/banks/hermes"
 PG_DSN = "host=127.0.0.1 port=5433 user=hindsight password=hindsight dbname=hindsight"
 
 
+def filter_existing_uids(uids: list[str]) -> list[str]:
+    """
+    通过 PG 批量查询 UID 是否存在。
+    分批（200 UID/批）避免"Argument list too long"。
+    返回 PG 中确实存在的 UID。
+    """
+    if not uids:
+        return []
+
+    existing = []
+    batch_size = 200
+    for i in range(0, len(uids), batch_size):
+        batch = uids[i:i + batch_size]
+        uid_list = ", ".join(f"'{u}'" for u in batch)
+        sql = f"SELECT id FROM memory_units WHERE id IN ({uid_list})"
+        try:
+            result = subprocess.run(
+                ["psql", "-h", "127.0.0.1", "-p", "5433", "-U", "hindsight",
+                 "-d", "hindsight", "-tA",
+                 "-c", sql],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "PGPASSWORD": "hindsight"}
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().split("\n"):
+                    line = line.strip()
+                    if line:
+                        existing.append(line)
+        except Exception as e:
+            logger.warning("  ⚠️ PG存在性查询失败(batch %d): %s", i // batch_size, e)
+
+    return existing
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  1. 扫描可压缩组
 # ═══════════════════════════════════════════════════════════════════
@@ -72,7 +106,9 @@ PG_DSN = "host=127.0.0.1 port=5433 user=hindsight password=hindsight dbname=hind
 def scan_compressible_groups(quality_file: str = QUALITY_FILE) -> list[dict]:
     """
     从 memory_quality.json 扫描可压缩组。
-    返回已排序列表（大组在前），每组包含 tag, entries, count, avg_q。
+    返回已排序列表（按 pg_exists_count 降序），
+    每组包含 tag, entries, count, avg_q, uids, pg_exists_count。
+    自动排除 PG 中全不存在的组。
     """
     with open(quality_file) as f:
         quality_data = json.load(f)
@@ -95,14 +131,25 @@ def scan_compressible_groups(quality_file: str = QUALITY_FILE) -> list[dict]:
             continue
         avg_q = sum(e["quality"] for e in entries) / len(entries)
         uids = [e["uid"] for e in entries]
+
+        # PG 存在性预检：查该组 UID 在 PG 中实际存在多少
+        pg_existing = filter_existing_uids(uids)
+        pg_exists_count = len(pg_existing)
+
+        # 排除 PG 中全不存在的组
+        if pg_exists_count == 0:
+            continue
+
         result.append({
             "tag": tag,
             "count": len(entries),
             "avg_q": round(avg_q, 4),
             "uids": uids,
+            "pg_exists_count": pg_exists_count,
         })
 
-    result.sort(key=lambda x: -x["count"])
+    # 按 pg_exists_count 降序（而不是 raw count）
+    result.sort(key=lambda x: -x["pg_exists_count"])
     return result
 
 
@@ -416,16 +463,19 @@ def update_quality_file(uids_removed: list[str], new_uid: str, new_quality: floa
 def cmd_scan():
     groups = scan_compressible_groups()
     total_entries = sum(g["count"] for g in groups)
+    total_pg_exists = sum(g["pg_exists_count"] for g in groups)
 
     print(f"📊 可压缩组数: {len(groups)}")
-    print(f"📦 涉及总记忆: {total_entries}")
-    print(f"📉 合并后预计: ~{len(groups)} 条（减少 ~{total_entries - len(groups)} 条）")
+    print(f"📦 涉及总记忆(quality.json): {total_entries}")
+    print(f"🗄️  PG 中真实存在: {total_pg_exists} ({(total_pg_exists/total_entries*100):.0f}%)")
+    print(f"📉 合并后预计: ~{len(groups)} 条（减少 ~{total_pg_exists - len(groups)} 条）")
     print()
-    print(f"{'排名':>4} {'主题':<50} {'条数':>6} {'平均q':>8}")
-    print("-" * 72)
+    print(f"{'排名':>4} {'主题':<46} {'条数':>6} {'PG存':>6} {'平均q':>8}")
+    print("-" * 74)
     for i, g in enumerate(groups, 1):
-        tag_short = g["tag"][:48]
-        print(f"{i:>4}  {tag_short:<50} {g['count']:>6} {g['avg_q']:>8.3f}")
+        tag_short = g["tag"][:44]
+        pct = f"{g['pg_exists_count']}/{g['count']}"
+        print(f"{i:>4}  {tag_short:<46} {g['count']:>6} {pct:>6} {g['avg_q']:>8.3f}")
     print()
     pg_count = get_pg_count()
     print(f"PG 当前总记忆数: {pg_count}")
@@ -554,7 +604,17 @@ def cmd_merge(groups_to_process: list[dict], force: bool = False,
         uids = group["uids"]
         print(f"\n[{idx+1}/{len(target_groups)}] 处理 {tag} ({len(uids)}条) ...")
 
-        # 1. 获取文本，过滤空内容
+        # 1. PG 存在性预检 + 获取文本，过滤空内容
+        print("  🔍 PG 存在性预检...")
+        existing_uids = filter_existing_uids(uids)
+        skipped = len(uids) - len(existing_uids)
+        if skipped:
+            print(f"     ⚠️ {skipped}/{len(uids)} 条在 PG 中已不存在，跳过")
+        if not existing_uids:
+            print("  ℹ️ PG 中无该组的记忆，跳过本组")
+            continue
+        uids = existing_uids
+
         print("  📡 获取记忆文本...")
         texts = fetch_texts_for_group(uids, tag)
         # 过滤掉无实质内容的条目（<20字）

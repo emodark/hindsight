@@ -206,7 +206,7 @@ def cmd_confirm(memory_id: str, delta: float = 0.1):
             }
         else:
             print(f"❌ 记忆 {memory_id[:16]}... 不存在")
-            return
+            sys.exit(1)
     
     entry = quality[memory_id]
     old_q = entry["quality"]
@@ -237,7 +237,7 @@ def cmd_correct(memory_id: str, delta: float = 0.2, correction_id: str | None = 
             }
         else:
             print(f"❌ 记忆 {memory_id[:16]}... 不存在")
-            return
+            sys.exit(1)
     
     entry = quality[memory_id]
     old_q = entry["quality"]

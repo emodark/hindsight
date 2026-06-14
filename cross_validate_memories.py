@@ -21,12 +21,14 @@ import time
 import math
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+from typing import Optional
 from urllib.request import Request, urlopen
 
 HOMES_DIR = os.path.expanduser("~/.hermes")
 API_BASE = "http://127.0.0.1:9177/v1/default/banks/hermes"
 QUALITY_FILE = os.path.join(HOMES_DIR, "hindsight", "memory_quality.json")
 CALIBRATE_SCRIPT = os.path.join(HOMES_DIR, "hindsight", "calibrate_memory.py")
+DOUBT_LIST = os.path.join(HOMES_DIR, "hindsight", "dreaming_doubt_list.json")
 
 # —— 来源置信度分级 ——
 # 基础分 × 时间衰减 + 微调因子 = 最终质量分
@@ -266,10 +268,116 @@ def extract_entity(mem: dict) -> str:
     return None  # 无法分组
 
 
+# ════════════════════════════════════════════════════════════════════
+# 实体类型判断（用于矛盾检测过滤）
+# ════════════════════════════════════════════════════════════════════
+
+TRADING_KEYWORDS = {
+    "持仓", "买入", "卖出", "止损", "止盈", "加仓", "减仓", "清仓",
+    "涨停", "跌停", "K线", "k线", "均线", "BOLL", "ADX", "MACD",
+    "量能", "放量", "缩量", "成交量", "换手率", "趋势", "突破",
+    "反弹", "回踩", "支撑", "压力", "仓位", "浮亏", "浮盈",
+    "技术面", "基本面", "策略", "回测", "评分", "评级",
+    "减持", "增持", "持仓股", "新仓", "建仓",
+}
+
+STOCK_ENTITY_PREFIXES = {"stock:", "company:stock:", "entity|stock:"}
+NON_TRADING_ENTITY_PREFIXES = {
+    "entity|concept:auto_retain", "entity:用户", "entity:User",
+    "entity:Hermes Agent", "entity:助理", "entity:MCTS",
+    "entity:MongoDB", "entity:Hindsight", "entity:WebUI",
+    "entity:LMDB", "entity|object:sync_turn",
+    "entity:db_schema_reference.md", "entity:state.db",
+    "entity|object:balance_sheet", "entity|object:project_update",
+    "entity|object:memory_arch", "entity|object:skills",
+}
+
+
+def _is_trading_entity(entity: str, group: list[dict]) -> tuple[bool, str]:
+    """判断实体组是否适合做矛盾检测（仅股票相关实体需要）。"""
+    # 1. 实体名前缀检查
+    if any(entity.startswith(p) for p in STOCK_ENTITY_PREFIXES):
+        return True, "stock_prefix"
+    if entity.startswith("company:"):
+        return True, "company_name"
+
+    # 2. 已知的非交易实体直接跳过
+    for prefix in NON_TRADING_ENTITY_PREFIXES:
+        if entity == prefix or entity.startswith(prefix):
+            return False, "known_non_trading"
+
+    # 3. 文本内容检查：如果组内大部分成员含交易关键词，视为交易实体
+    trading_count = 0
+    for m in group:
+        text = (m.get("text", "") or "").lower()
+        if any(kw in text for kw in TRADING_KEYWORDS):
+            trading_count += 1
+    ratio = trading_count / max(len(group), 1)
+    if ratio >= 0.6:
+        return True, "trading_content"
+
+    # 4. 按实体名前缀分类
+    if entity.startswith("entity|concept:") or entity.startswith("entity|object:"):
+        # 概念/对象记忆 → 不是交易实体
+        return False, "concept_object"
+    if entity.startswith("entity:"):
+        # entity:xxx — 如果有股票代码或交易关键词才判定为交易
+        code_pattern = re.compile(r'[036]\d{5}')
+        for m in group:
+            if code_pattern.search(m.get("text", "") or ""):
+                return True, "entity_with_stock_code"
+        return False, "general_entity"
+    if entity.startswith("tag:"):
+        return False, "tag_fallback"
+    if entity.startswith("path:"):
+        return False, "path_entity"
+
+    # 5. 兜底：非交易实体
+    return False, "default"
+
+
+# ════════════════════════════════════════════════════════════════════
+# 时间感知工具
+# ════════════════════════════════════════════════════════════════════
+
+def _extract_date(mem: dict) -> Optional[str]:
+    """提取记忆的日期字符串（YYYY-MM-DD）。"""
+    date_str = mem.get("date") or mem.get("mentioned_at")
+    if not date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _same_calendar_day(m1: dict, m2: dict) -> bool:
+    """两条记忆是否在同一天。"""
+    d1 = _extract_date(m1)
+    d2 = _extract_date(m2)
+    if d1 is None or d2 is None:
+        return True  # 无时间戳视为同天（不跳过矛盾检测）
+    return d1 == d2
+
+
+def _date_distance_days(mem: dict) -> Optional[int]:
+    """记忆距今的天数（仅用于统计输出）。"""
+    date_str = mem.get("date") or mem.get("mentioned_at")
+    if not date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (now - dt).days
+    except (ValueError, TypeError):
+        return None
+
+
 def detect_contradictions(memories: list[dict], max_group_size: int = 20) -> dict[str, list[str]]:
     """矛盾检测 — 按实体分组，找冲突对。
 
-    限制最大分组大小避免通用tag导致的误报。
+    仅对股票/交易相关实体做矛盾检测，其他实体只记录分组不触发惩罚。
     返回: {实体: [矛盾方记忆ID列表]}
     """
     contradictions = defaultdict(list)
@@ -286,10 +394,21 @@ def detect_contradictions(memories: list[dict], max_group_size: int = 20) -> dic
                        if 2 <= len(g) <= max_group_size}
 
     contradictions = defaultdict(list)
+    trading_groups = 0
+    skipped_groups = 0
+    temporal_skipped = 0
+    true_contradictions = 0
 
     for entity, group in filtered_groups.items():
         if len(group) < 2:
             continue
+
+        # 判断是否为交易实体
+        is_trading, reason = _is_trading_entity(entity, group)
+        if not is_trading:
+            skipped_groups += 1
+            continue  # 非交易实体跳过矛盾检测
+        trading_groups += 1
 
         # 对每个组内成员，检查是否存在否定 vs 肯定的冲突
         for i, m1 in enumerate(group):
@@ -306,12 +425,21 @@ def detect_contradictions(memories: list[dict], max_group_size: int = 20) -> dic
 
                 # 一个说有、一个说没有 → 矛盾对
                 if (has_neg1 and has_aff2) or (has_aff1 and has_neg2):
+                    # 时间感知：不同天的冲突视为时序快照，不标记为矛盾
+                    if not _same_calendar_day(m1, m2):
+                        temporal_skipped += 1
+                        continue  # 不同天，是持仓变化，不是矛盾
+                    true_contradictions += 1
                     contradictions[m1["id"]].append(m2["id"])
                     contradictions[m2["id"]].append(m1["id"])
 
     print(f"   分组: {len(entity_groups)} 个实体, "
           f"{len(filtered_groups)} 个可检测组 "
           f"(排除 {len(entity_groups)-len(filtered_groups)} 个过大组)")
+    print(f"   交易实体组: {trading_groups}, 跳过: {skipped_groups} (非交易实体)")
+    if temporal_skipped > 0:
+        print(f"   时间感知过滤: {temporal_skipped} 对（不同天的持仓变化，视为快照不标记）")
+    print(f"   最终矛盾对: {true_contradictions}")
     return dict(contradictions)
 
 
@@ -464,7 +592,7 @@ def build_suspicion_report(memories: list[dict], quality: dict,
             text = (m.get("text", "") or "")[:100]
             seen_ids.add(mid)
             suspicions.append({
-                "id": mid[:16],
+                "id": mid,
                 "quality": q,
                 "reason": f"低置信度({q:.2f})",
                 "text": text,
@@ -485,11 +613,11 @@ def build_suspicion_report(memories: list[dict], quality: dict,
                 else:
                     q = q_raw
                 suspicions.append({
-                    "id": mid[:16],
+                    "id": mid,
                     "quality": q,
                     "reason": f"矛盾(与{len(conflicting)}条冲突)",
                     "text": text,
-                    "conflicts_with": [c[:16] for c in conflicting[:3]],
+                    "conflicts_with": conflicting[:3],
                 })
 
     return suspicions
@@ -503,6 +631,7 @@ def main():
     dry_run = "--dry-run" in sys.argv
     show_suspicions_only = "--suspicions" in sys.argv
     bootstrap_mode = "--bootstrap" in sys.argv
+    export_suspicions = "--export-suspicions" in sys.argv
 
     print(f"{'🔍 记忆交叉验证' + (' [DRY RUN]' if dry_run else '')}")
     print(f"时间: {datetime.now(timezone.utc).isoformat()}\n")
@@ -565,7 +694,7 @@ def main():
         print(f"     {k}: {v:4d} {bar}")
 
     # Step 5: 调查疑清单
-    if show_suspicions_only or dry_run:
+    if show_suspicions_only or dry_run or export_suspicions:
         existing = load_existing_quality()
         reports = build_suspicion_report(memories, quality_scores, contradictions)
         print(f"\n🔎 怀疑清单 ({len(reports)} 条):")
@@ -576,6 +705,31 @@ def main():
             if "conflicts_with" in r:
                 print(f"     ↕ 冲突: {', '.join(r['conflicts_with'])}")
             print()
+
+        # --export-suspicions: 写入怀疑清单供 calibrate_runner.py 消费
+        if export_suspicions:
+            doubt_data = {
+                "suspicions": reports[:50],  # 最多50条，防止过大
+                "confirmed": [],
+                "corrected": [],
+                "total_suspicions": len(reports),
+                "low_quality_count": sum(1 for r in reports if "低置信度" in r.get("reason", "")),
+                "contradiction_count": sum(1 for r in reports if "矛盾" in r.get("reason", "")),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                # 保留已有的 confirmed/corrected（来自之前的 LLM 审查结果）
+                if os.path.exists(DOUBT_LIST):
+                    with open(DOUBT_LIST) as f:
+                        existing_doubt = json.load(f)
+                    doubt_data["confirmed"] = existing_doubt.get("confirmed", [])
+                    doubt_data["corrected"] = existing_doubt.get("corrected", [])
+                with open(DOUBT_LIST, "w") as f:
+                    json.dump(doubt_data, f, indent=2, ensure_ascii=False)
+                print(f"📝 已导出 {len(reports)} 条怀疑到 {DOUBT_LIST}")
+            except Exception as e:
+                print(f"  ⚠️ 导出怀疑清单失败: {e}")
+
         if show_suspicions_only:
             return 0
 

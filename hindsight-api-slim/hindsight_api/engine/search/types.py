@@ -49,6 +49,7 @@ class RetrievalResult:
     tags: list[str] | None = None  # Visibility scope tags
     metadata: dict[str, str] | None = None  # User-provided metadata
     proof_count: int | None = None  # Number of supporting memories (observations only)
+    decayed_quality: float | None = None  # Ebbinghaus decay quality score
 
     # Retrieval-specific scores (only one will be set depending on retrieval method)
     similarity: float | None = None  # Semantic retrieval
@@ -79,6 +80,7 @@ class RetrievalResult:
             activation=row.get("activation"),
             temporal_score=row.get("temporal_score"),
             temporal_proximity=row.get("temporal_proximity"),
+            decayed_quality=row.get("decayed_quality"),
         )
 
 
@@ -160,6 +162,7 @@ class ScoredResult:
             "metadata": self.retrieval.metadata,
             "semantic_similarity": self.retrieval.similarity,
             "bm25_score": self.retrieval.bm25_score,
+            "decayed_quality": self.retrieval.decayed_quality,
         }
 
         # Add temporal scores if present

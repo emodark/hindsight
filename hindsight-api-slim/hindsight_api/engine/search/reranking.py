@@ -9,12 +9,27 @@ from .types import MergedCandidate, ScoredResult
 
 UTC = timezone.utc
 
-# Multiplicative boost alphas for recency and temporal proximity.
+# Multiplicative boost alphas for recency, temporal proximity, quality, and proof count.
 # Each signal contributes at most ±(alpha/2) relative adjustment to the base CE score,
 # so the max combined boost is (1 + alpha/2)^2 ≈ +21% and min is (1 - alpha/2)^2 ≈ -19%.
 _RECENCY_ALPHA: float = 0.2
 _TEMPORAL_ALPHA: float = 0.2
+_QUALITY_ALPHA: float = 0.15  # Ebbinghaus decay quality: max ±7.5% adjustment
 _PROOF_COUNT_ALPHA: float = 0.1  # Conservative: max ±5% for evidence strength
+
+
+def _normalize_quality(raw: float | None) -> float:
+    """Normalize decayed_quality from [0.08, 0.9] → [0.1, 0.9] for boost calculation.
+
+    0.08 (coldest, least relevant) → 0.1 (lowest boost)
+    0.50 (medium) → ~0.51 (near-neutral)
+    0.90 (warm, most relevant) → 0.9 (highest boost)
+    None (no decay data) → 0.5 (neutral, no effect)
+    """
+    if raw is None:
+        return 0.5
+    clamped = max(0.08, min(0.9, raw))
+    return 0.1 + 0.8 * (clamped - 0.08) / 0.82
 
 
 def apply_combined_scoring(
@@ -22,23 +37,25 @@ def apply_combined_scoring(
     now: datetime,
     recency_alpha: float = _RECENCY_ALPHA,
     temporal_alpha: float = _TEMPORAL_ALPHA,
+    quality_alpha: float = _QUALITY_ALPHA,
     proof_count_alpha: float = _PROOF_COUNT_ALPHA,
     is_passthrough_reranker: bool = False,
 ) -> None:
     """Apply combined scoring to a list of ScoredResults in-place.
 
     Uses the cross-encoder score as the primary relevance signal, with recency,
-    temporal proximity, and proof count applied as multiplicative boosts. This
-    ensures the influence of these secondary signals is always proportional to
-    the base relevance score, regardless of the cross-encoder model's score
-    calibration.
+    temporal proximity, decay quality (Ebbinghaus), and proof count applied as
+    multiplicative boosts. This ensures the influence of these secondary signals
+    is always proportional to the base relevance score, regardless of the
+    cross-encoder model's score calibration.
 
     Formula::
 
-        recency_boost     = 1 + recency_alpha     * (recency     - 0.5)   # in [1-α/2, 1+α/2]
-        temporal_boost    = 1 + temporal_alpha    * (temporal    - 0.5)   # in [1-α/2, 1+α/2]
-        proof_count_boost = 1 + proof_count_alpha * (proof_norm  - 0.5)   # in [1-α/2, 1+α/2]
-        combined_score    = CE_normalized * recency_boost * temporal_boost * proof_count_boost
+        recency_boost        = 1 + recency_alpha     * (recency     - 0.5)   # in [1-α/2, 1+α/2]
+        temporal_boost       = 1 + temporal_alpha    * (temporal    - 0.5)   # in [1-α/2, 1+α/2]
+        quality_boost        = 1 + quality_alpha     * (quality_norm - 0.5)  # in [1-α/2, 1+α/2]
+        proof_count_boost    = 1 + proof_count_alpha * (proof_norm  - 0.5)   # in [1-α/2, 1+α/2]
+        combined_score       = CE_normalized * recency_boost * temporal_boost * quality_boost * proof_count_boost
 
     proof_norm maps proof_count using a smooth logarithmic curve centered at 0.5,
     clamped to [0, 1]:
@@ -126,7 +143,14 @@ def apply_combined_scoring(
         recency_boost = 1.0 + recency_alpha * (sr.recency - 0.5)
         temporal_boost = 1.0 + temporal_alpha * (sr.temporal - 0.5)
         proof_count_boost = 1.0 + proof_count_alpha * (proof_norm - 0.5)
-        sr.combined_score = sr.cross_encoder_score_normalized * recency_boost * temporal_boost * proof_count_boost
+
+        # Ebbinghaus decay quality: memories with low decayed_quality get a
+        # mild penalty (older/unused memories rank slightly lower), high
+        # quality memories get a mild boost. Neutral (0.5) when no decay data.
+        quality_norm = _normalize_quality(sr.retrieval.decayed_quality)
+        quality_boost = 1.0 + quality_alpha * (quality_norm - 0.5)
+
+        sr.combined_score = sr.cross_encoder_score_normalized * recency_boost * temporal_boost * quality_boost * proof_count_boost
         sr.weight = sr.combined_score
 
 
